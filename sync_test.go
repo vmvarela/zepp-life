@@ -35,6 +35,20 @@ func weightItemJSON(id string, generatedTime any, summary map[string]any) map[st
 	return map[string]any{"id": id, "generatedTime": generatedTime, "summary": summary}
 }
 
+// createTestDatabase creates the database at path and closes the handle
+// immediately: the handle must not outlive the test, or Windows refuses to
+// delete the TempDir because zepp_life.db is still open.
+func createTestDatabase(t *testing.T, path string) {
+	t.Helper()
+	db, _, err := openOrCreateDatabase(path)
+	if err != nil {
+		t.Fatalf("create database: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close test database: %v", err)
+	}
+}
+
 func openTestDB(t *testing.T, path string) *sql.DB {
 	t.Helper()
 	db, err := openReadWrite(path)
@@ -487,9 +501,7 @@ func TestSyncLeavesAnIncompleteDatabaseUntouched(t *testing.T) {
 
 func TestSyncFailureKeepsCursorAndRecordsTheError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), databaseFile)
-	if _, _, err := openOrCreateDatabase(path); err != nil {
-		t.Fatalf("create database: %v", err)
-	}
+	createTestDatabase(t, path)
 	seedSyncState(t, path, "123456", "2026-01-01")
 
 	secrets := map[string]string{
@@ -541,9 +553,7 @@ func TestSyncFailureKeepsCursorAndRecordsTheError(t *testing.T) {
 
 func TestSyncFetchFailureKeepsCursor(t *testing.T) {
 	path := filepath.Join(t.TempDir(), databaseFile)
-	if _, _, err := openOrCreateDatabase(path); err != nil {
-		t.Fatalf("create database: %v", err)
-	}
+	createTestDatabase(t, path)
 	seedSyncState(t, path, "123456", "2026-01-01")
 
 	secrets := map[string]string{
@@ -581,9 +591,7 @@ func TestSyncFetchFailureKeepsCursor(t *testing.T) {
 
 func TestSyncUsesTheStoredCursorAsDefaultStart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), databaseFile)
-	if _, _, err := openOrCreateDatabase(path); err != nil {
-		t.Fatalf("create database: %v", err)
-	}
+	createTestDatabase(t, path)
 	seedSyncState(t, path, "123456", "2025-11-02")
 
 	secrets := map[string]string{
@@ -639,9 +647,7 @@ func TestSyncExplicitWindowFiltersTheLocalDates(t *testing.T) {
 
 func TestSyncKeepsUnchangedNullRowsUntouched(t *testing.T) {
 	path := filepath.Join(t.TempDir(), databaseFile)
-	if _, _, err := openOrCreateDatabase(path); err != nil {
-		t.Fatalf("create database: %v", err)
-	}
+	createTestDatabase(t, path)
 	db := openTestDB(t, path)
 	// A row with NULL optional columns, written exactly like this sync would.
 	if _, err := db.Exec(`
