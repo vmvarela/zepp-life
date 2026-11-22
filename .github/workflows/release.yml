@@ -1,0 +1,790 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+env:
+  NFPM_VERSION: "2.45.1"
+
+# One run per tag at a time: a rerun of the same tag queues behind the
+# in-flight run instead of interleaving asset uploads. This only serializes
+# separate runs; it does not replace the per-job isDraft guards that stop
+# a job-only rerun from writing into an already-public release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # The push trigger matches v*.*.*, which also accepts v1.2.3-rc.1 and
+  # friends. Everything downstream waits on this guard, so a malformed tag
+  # fails before any build or release work starts.
+  guard:
+    name: Guard tag format
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a strict vX.Y.Z tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::tag '$GITHUB_REF_NAME' is not a strict semver tag (expected vX.Y.Z)"
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.asset }}
+    needs: guard
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The six targets documented in README.md, CGO disabled: the
+          # SQLite driver is pure Go, so every cross-build is static.
+          - goos: linux
+            goarch: amd64
+            asset: zepp-life-linux-amd64
+          - goos: linux
+            goarch: arm64
+            asset: zepp-life-linux-arm64
+          - goos: darwin
+            goarch: amd64
+            asset: zepp-life-darwin-amd64
+          - goos: darwin
+            goarch: arm64
+            asset: zepp-life-darwin-arm64
+          - goos: windows
+            goarch: amd64
+            asset: zepp-life-windows-amd64.exe
+          - goos: windows
+            goarch: arm64
+            asset: zepp-life-windows-arm64.exe
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${VERSION}" \
+            -o "dist/${{ matrix.asset }}" .
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/
+          if-no-files-found: error
+
+  man:
+    name: Build man page
+    needs: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install scdoc
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y scdoc
+
+      - name: Render and gzip the man page
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # -n keeps the archive reproducible: no timestamp or file name.
+          scdoc < docs/zepp-life.1.scd | gzip -n > dist/zepp-life.1.gz
+          test -s dist/zepp-life.1.gz
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: man
+          path: dist/zepp-life.1.gz
+          if-no-files-found: error
+
+  # The third-party notices file ships as a release asset so every package
+  # channel and direct download can pick it up alongside the binary.
+  notices:
+    name: Stage third-party notices
+    needs: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Verify the notices file is present
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s THIRD_PARTY_NOTICES.txt
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: notices
+          path: THIRD_PARTY_NOTICES.txt
+          if-no-files-found: error
+
+  # Stages the release as a DRAFT. It stays private until publish-release,
+  # which runs only after every asset, package and checksum is in place.
+  release:
+    name: Stage release draft
+    needs: [build, man, notices]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Create or reuse draft and upload binaries
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          REPO="${GITHUB_REPOSITORY}"
+          if IS_DRAFT=$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq '.isDraft' 2>/dev/null); then
+            if [ "$IS_DRAFT" != "true" ]; then
+              echo "::error::release $TAG is already published; a rerun must not reopen it or prune its assets"
+              exit 1
+            fi
+            # Reusing a draft: prune assets from an earlier attempt that this
+            # run does not produce. Never reached for a published release.
+            for name in $(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name'); do
+              [ -e "artifacts/$name" ] || gh release delete-asset "$TAG" "$name" --repo "$REPO" --yes
+            done
+          else
+            # No release yet. If the view failed for any other reason, the
+            # create below fails without mutating anything that exists.
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --generate-notes \
+              --draft \
+              --repo "$REPO"
+          fi
+          gh release upload "$TAG" artifacts/* --repo "$REPO" --clobber
+
+  # ── deb, rpm and apk ────────────────────────────────────────────────
+  # One job per packager and architecture: each package carries the binary,
+  # the man page, the MIT license and the third-party notices. Names follow
+  # the package-distribution catalog convention, so the receivers can pick
+  # them up unchanged.
+  package:
+    name: Package ${{ matrix.packager }} (${{ matrix.goarch }})
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        packager: [deb, rpm, apk]
+        goarch: [amd64, arm64]
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Install nfpm
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sfL -o /tmp/nfpm.tar.gz \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          sudo tar -xzf /tmp/nfpm.tar.gz -C /usr/local/bin nfpm
+
+      - name: Stage files for packaging
+        shell: bash
+        env:
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          case "$GOARCH" in
+            amd64) asset=zepp-life-linux-amd64 ;;
+            arm64) asset=zepp-life-linux-arm64 ;;
+            *) echo "::error::unexpected architecture $GOARCH" >&2; exit 1 ;;
+          esac
+          mkdir -p pkg-work
+          cp "artifacts/$asset" pkg-work/zepp-life
+          chmod +x pkg-work/zepp-life
+          cp artifacts/zepp-life.1.gz pkg-work/zepp-life.1.gz
+          cp LICENSE pkg-work/LICENSE
+          cp THIRD_PARTY_NOTICES.txt pkg-work/THIRD_PARTY_NOTICES.txt
+
+      - name: Build ${{ matrix.packager }}
+        shell: bash
+        working-directory: ${{ github.workspace }}/pkg-work
+        env:
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          VERSION="$VERSION" GOARCH="$GOARCH" \
+            nfpm package -p "${{ matrix.packager }}" \
+              -f "$GITHUB_WORKSPACE/packaging/nfpm.yaml" -t dist/
+
+      - name: Upload ${{ matrix.packager }} to the draft release
+        shell: bash
+        working-directory: ${{ github.workspace }}/pkg-work
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # A rerun of only this job can reach this step after the release
+          # went public: read the state fresh and fail closed unless the
+          # release is still a draft. Nothing mutates before this check.
+          if ! IS_DRAFT=$(gh release view "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" --json isDraft --jq '.isDraft'); then
+            echo "::error::cannot read the isDraft state of ${GITHUB_REF_NAME}; refusing to upload"
+            exit 1
+          fi
+          if [ "$IS_DRAFT" != "true" ]; then
+            echo "::error::release ${GITHUB_REF_NAME} is already published; refusing to upload assets"
+            exit 1
+          fi
+          gh release upload "${GITHUB_REF_NAME}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" --clobber
+
+  # ── Generate final SHA256 checksums ─────────────────────────────────
+  # Runs after all packaging jobs (all must succeed) so sha256sums.txt
+  # covers every asset: six binaries, the man page, the third-party
+  # notices and the six packages. The pre-checksum file set must equal
+  # the intended 14 assets exactly — an unexpected file on the draft is
+  # a failure, never silently hashed.
+  checksums:
+    name: Generate SHA256 checksums
+    needs: [release, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p assets
+          gh release download "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --dir assets
+
+      - name: Verify asset set and generate SHA256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd assets
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Exact allowlist: these 14 assets and nothing else.
+          expected=(
+            zepp-life-linux-amd64
+            zepp-life-linux-arm64
+            zepp-life-darwin-amd64
+            zepp-life-darwin-arm64
+            zepp-life-windows-amd64.exe
+            zepp-life-windows-arm64.exe
+            zepp-life.1.gz
+            THIRD_PARTY_NOTICES.txt
+            "zepp-life_${VERSION}_amd64.deb"
+            "zepp-life_${VERSION}_arm64.deb"
+            "zepp-life-${VERSION}-1.x86_64.rpm"
+            "zepp-life-${VERSION}-1.aarch64.rpm"
+            "zepp-life_${VERSION}_x86_64.apk"
+            "zepp-life_${VERSION}_aarch64.apk"
+          )
+          mapfile -t expected < <(printf '%s\n' "${expected[@]}" | sort)
+
+          actual=()
+          for f in *; do
+            [ "$f" = sha256sums.txt ] || actual+=("$f")
+          done
+          mapfile -t actual < <(printf '%s\n' "${actual[@]}" | sort)
+
+          if [ "${#expected[@]}" -ne "${#actual[@]}" ] || [ "${expected[*]}" != "${actual[*]}" ]; then
+            echo "::error::draft assets are not exactly the intended ${#expected[@]} release assets"
+            diff <(printf '%s\n' "${expected[@]}") <(printf '%s\n' "${actual[@]}") || true
+            exit 1
+          fi
+
+          # Hash only the verified allowlist, in stable sorted order.
+          sha256sum "${expected[@]}" | tee sha256sums.txt
+
+      - name: Upload sha256sums.txt to the draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # A rerun of only this job can reach this step after the release
+          # went public: read the state fresh and fail closed unless the
+          # release is still a draft. Nothing mutates before this check.
+          if ! IS_DRAFT=$(gh release view "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" --json isDraft --jq '.isDraft'); then
+            echo "::error::cannot read the isDraft state of ${GITHUB_REF_NAME}; refusing to upload"
+            exit 1
+          fi
+          if [ "$IS_DRAFT" != "true" ]; then
+            echo "::error::release ${GITHUB_REF_NAME} is already published; refusing to upload assets"
+            exit 1
+          fi
+          gh release upload "${GITHUB_REF_NAME}" assets/sha256sums.txt \
+            --repo "${GITHUB_REPOSITORY}" --clobber
+
+  # ── Publish the GitHub Release ──────────────────────────────────────
+  # The only step that makes the release public. It re-downloads every
+  # asset from the draft and checks bytes and file set against sha256sums.txt.
+  publish-release:
+    name: Publish GitHub Release
+    needs: [release, package, checksums]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Verify draft assets against sha256sums.txt
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERIFY_DIR="$(mktemp -d)"
+          gh release download "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --dir "$VERIFY_DIR"
+          cd "$VERIFY_DIR"
+          sha256sum --check sha256sums.txt
+          diff <(find . -maxdepth 1 -type f ! -name sha256sums.txt -exec basename {} \; | sort) \
+               <(awk '{ print $2 }' sha256sums.txt | sort)
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release edit "${GITHUB_REF_NAME}" --draft=false \
+            --repo "${GITHUB_REPOSITORY}"
+
+  # ── Publish to npm ──────────────────────────────────────────────────
+  # Two mutually exclusive paths, each with its own least privilege:
+  #   * Trusted publishing (OIDC): repository variable NPM_TRUSTED_PUBLISHING
+  #     is true. No token; --provenance is on; id-token: write is granted.
+  #   * Token: the variable is not set and the NPM_TOKEN secret exists.
+  #     NODE_AUTH_TOKEN only, no OIDC and no --provenance.
+  # Neither configured → both jobs no-op and the release still ships.
+  # Both paths share the manifest, the version rewrite and --access public.
+  # Requires the package @vmvarela/zepp-life to be claimed on npmjs.com.
+  publish-npm:
+    name: Publish to npm (trusted publishing)
+    needs: publish-release
+    if: ${{ vars.NPM_TRUSTED_PUBLISHING == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Stage npm binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p npm-pkg/bin
+          cp -r packaging/npm/. npm-pkg/
+          cp LICENSE npm-pkg/LICENSE
+          cp THIRD_PARTY_NOTICES.txt npm-pkg/THIRD_PARTY_NOTICES.txt
+          cp artifacts/zepp-life-linux-amd64      npm-pkg/bin/zepp-life-linux-x64
+          cp artifacts/zepp-life-linux-arm64      npm-pkg/bin/zepp-life-linux-arm64
+          cp artifacts/zepp-life-darwin-amd64     npm-pkg/bin/zepp-life-darwin-x64
+          cp artifacts/zepp-life-darwin-arm64     npm-pkg/bin/zepp-life-darwin-arm64
+          cp artifacts/zepp-life-windows-amd64.exe npm-pkg/bin/zepp-life-win32-x64.exe
+          cp artifacts/zepp-life-windows-arm64.exe npm-pkg/bin/zepp-life-win32-arm64.exe
+          chmod +x npm-pkg/bin/zepp-life-linux-* npm-pkg/bin/zepp-life-darwin-*
+
+      - name: Set package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          npm version "$VERSION" --no-git-tag-version --workspaces=false --prefix ./npm-pkg
+
+      - name: Publish to npm
+        run: npm publish ./npm-pkg --provenance --access public
+
+  # Token fallback: secrets are not readable in a job-level if, so the
+  # presence of NPM_TOKEN is computed into env and each step checks it.
+  publish-npm-token:
+    name: Publish to npm (token)
+    needs: publish-release
+    if: ${{ vars.NPM_TRUSTED_PUBLISHING != 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v7
+        if: ${{ env.HAS_NPM_TOKEN == 'true' }}
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        if: ${{ env.HAS_NPM_TOKEN == 'true' }}
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Download all artifacts
+        if: ${{ env.HAS_NPM_TOKEN == 'true' }}
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Stage npm binaries
+        if: ${{ env.HAS_NPM_TOKEN == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p npm-pkg/bin
+          cp -r packaging/npm/. npm-pkg/
+          cp LICENSE npm-pkg/LICENSE
+          cp THIRD_PARTY_NOTICES.txt npm-pkg/THIRD_PARTY_NOTICES.txt
+          cp artifacts/zepp-life-linux-amd64      npm-pkg/bin/zepp-life-linux-x64
+          cp artifacts/zepp-life-linux-arm64      npm-pkg/bin/zepp-life-linux-arm64
+          cp artifacts/zepp-life-darwin-amd64     npm-pkg/bin/zepp-life-darwin-x64
+          cp artifacts/zepp-life-darwin-arm64     npm-pkg/bin/zepp-life-darwin-arm64
+          cp artifacts/zepp-life-windows-amd64.exe npm-pkg/bin/zepp-life-win32-x64.exe
+          cp artifacts/zepp-life-windows-arm64.exe npm-pkg/bin/zepp-life-win32-arm64.exe
+          chmod +x npm-pkg/bin/zepp-life-linux-* npm-pkg/bin/zepp-life-darwin-*
+
+      - name: Set package version
+        if: ${{ env.HAS_NPM_TOKEN == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          npm version "$VERSION" --no-git-tag-version --workspaces=false --prefix ./npm-pkg
+
+      - name: Publish to npm
+        if: ${{ env.HAS_NPM_TOKEN == 'true' }}
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish ./npm-pkg --access public
+
+  # ── Update Homebrew tap ─────────────────────────────────────────────
+  # Requires:
+  #   1. Repository: vmvarela/homebrew-tap (with a Formula/ directory)
+  #   2. Secret: PACKAGE_DISTRIBUTION_TOKEN (fine-grained PAT with
+  #      contents:write on vmvarela/homebrew-tap)
+  update-homebrew:
+    name: Update Homebrew tap
+    needs: publish-release
+    runs-on: ubuntu-latest
+    env:
+      HAS_HOMEBREW_TOKEN: ${{ secrets.PACKAGE_DISTRIBUTION_TOKEN != '' }}
+    steps:
+      - name: Download all artifacts
+        if: ${{ env.HAS_HOMEBREW_TOKEN == 'true' }}
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Generate formula and push to tap
+        if: ${{ env.HAS_HOMEBREW_TOKEN == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGE_DISTRIBUTION_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+
+          SHA_MACOS_ARM64=$(sha256sum artifacts/zepp-life-darwin-arm64 | awk '{print $1}')
+          SHA_MACOS_X64=$(sha256sum artifacts/zepp-life-darwin-amd64   | awk '{print $1}')
+          SHA_LINUX_ARM64=$(sha256sum artifacts/zepp-life-linux-arm64   | awk '{print $1}')
+          SHA_LINUX_X64=$(sha256sum artifacts/zepp-life-linux-amd64     | awk '{print $1}')
+          SHA_MAN=$(sha256sum artifacts/zepp-life.1.gz                  | awk '{print $1}')
+          SHA_NOTICES=$(sha256sum artifacts/THIRD_PARTY_NOTICES.txt     | awk '{print $1}')
+
+          cat > zepp-life.rb <<'FORMULA'
+          class ZeppLife < Formula
+            desc "Store your Zepp Life data locally and inspect it"
+            homepage "https://github.com/vmvarela/zepp-life"
+            version "__VERSION__"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/vmvarela/zepp-life/releases/download/v__VERSION__/zepp-life-darwin-arm64"
+                sha256 "__SHA_MACOS_ARM64__"
+              end
+              on_intel do
+                url "https://github.com/vmvarela/zepp-life/releases/download/v__VERSION__/zepp-life-darwin-amd64"
+                sha256 "__SHA_MACOS_X64__"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/vmvarela/zepp-life/releases/download/v__VERSION__/zepp-life-linux-arm64"
+                sha256 "__SHA_LINUX_ARM64__"
+              end
+              on_intel do
+                url "https://github.com/vmvarela/zepp-life/releases/download/v__VERSION__/zepp-life-linux-amd64"
+                sha256 "__SHA_LINUX_X64__"
+              end
+            end
+
+            resource "man" do
+              url "https://github.com/vmvarela/zepp-life/releases/download/v__VERSION__/zepp-life.1.gz",
+                  using: :nounzip
+              sha256 "__SHA_MAN__"
+            end
+
+            resource "notices" do
+              url "https://github.com/vmvarela/zepp-life/releases/download/v__VERSION__/THIRD_PARTY_NOTICES.txt"
+              sha256 "__SHA_NOTICES__"
+            end
+
+            def install
+              bin.install Dir["zepp-life*"].first => "zepp-life"
+              # The release asset is a plain curl download, not executable.
+              chmod 0755, bin/"zepp-life"
+              # :nounzip keeps the gz bytes, so the name matches the content.
+              resource("man").stage { man1.install "zepp-life.1.gz" }
+              resource("notices").stage do
+                (share/"licenses/zepp-life").install "THIRD_PARTY_NOTICES.txt"
+              end
+            end
+
+            test do
+              assert_match "zepp-life", shell_output("#{bin}/zepp-life --version 2>&1")
+            end
+          end
+          FORMULA
+
+          # Substitute placeholders with the values of this release.
+          sed -i "s/__VERSION__/${VERSION}/g"               zepp-life.rb
+          sed -i "s/__SHA_MACOS_ARM64__/${SHA_MACOS_ARM64}/g" zepp-life.rb
+          sed -i "s/__SHA_MACOS_X64__/${SHA_MACOS_X64}/g"   zepp-life.rb
+          sed -i "s/__SHA_LINUX_ARM64__/${SHA_LINUX_ARM64}/g" zepp-life.rb
+          sed -i "s/__SHA_LINUX_X64__/${SHA_LINUX_X64}/g"   zepp-life.rb
+          sed -i "s/__SHA_MAN__/${SHA_MAN}/g"               zepp-life.rb
+          sed -i "s/__SHA_NOTICES__/${SHA_NOTICES}/g"       zepp-life.rb
+
+          # Push via the GitHub Contents API: no clone or push needed, and
+          # it works with a fine-grained PAT scoped to the tap.
+          CURRENT_SHA=$(gh api "repos/vmvarela/homebrew-tap/contents/Formula/zepp-life.rb" \
+            --jq '.sha' 2>/dev/null || echo "")
+
+          if [ -n "$CURRENT_SHA" ]; then
+            gh api "repos/vmvarela/homebrew-tap/contents/Formula/zepp-life.rb" \
+              --method PUT \
+              -f "message=zepp-life ${VERSION}" \
+              -f "content=$(base64 -w0 zepp-life.rb)" \
+              -f "sha=${CURRENT_SHA}"
+          else
+            gh api "repos/vmvarela/homebrew-tap/contents/Formula/zepp-life.rb" \
+              --method PUT \
+              -f "message=zepp-life ${VERSION}" \
+              -f "content=$(base64 -w0 zepp-life.rb)"
+          fi
+
+  # ── Update AUR package ──────────────────────────────────────────────
+  # Requires:
+  #   1. AUR package registered: https://aur.archlinux.org/packages/zepp-life
+  #   2. Secret: PACKAGE_SSH_KEY (SSH private key authorized on AUR)
+  update-aur:
+    name: Update AUR package
+    needs: publish-release
+    runs-on: ubuntu-latest
+    env:
+      HAS_AUR_KEY: ${{ secrets.PACKAGE_SSH_KEY != '' }}
+    steps:
+      - uses: actions/checkout@v7
+        if: ${{ env.HAS_AUR_KEY == 'true' }}
+        with:
+          persist-credentials: false
+
+      - name: Download all artifacts
+        if: ${{ env.HAS_AUR_KEY == 'true' }}
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Generate PKGBUILD
+        if: ${{ env.HAS_AUR_KEY == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+
+          SHA_X86_64=$(sha256sum artifacts/zepp-life-linux-amd64 | awk '{print $1}')
+          SHA_AARCH64=$(sha256sum artifacts/zepp-life-linux-arm64 | awk '{print $1}')
+          SHA_MAN=$(sha256sum artifacts/zepp-life.1.gz | awk '{print $1}')
+          SHA_NOTICES=$(sha256sum artifacts/THIRD_PARTY_NOTICES.txt | awk '{print $1}')
+          SHA_LICENSE=$(sha256sum LICENSE | awk '{print $1}')
+
+          cat > PKGBUILD <<'PKGEOF'
+          # Maintainer: vmvarela <vmvarela@gmail.com>
+          pkgname=zepp-life
+          pkgver=__VERSION__
+          pkgrel=1
+          pkgdesc="Store your Zepp Life data locally and inspect it"
+          arch=('x86_64' 'aarch64')
+          url="https://github.com/vmvarela/zepp-life"
+          license=('MIT')
+          provides=("${pkgname}")
+          conflicts=("${pkgname}")
+
+          source=("LICENSE::https://raw.githubusercontent.com/vmvarela/zepp-life/v${pkgver}/LICENSE"
+                  "THIRD_PARTY_NOTICES.txt::https://github.com/vmvarela/zepp-life/releases/download/v${pkgver}/THIRD_PARTY_NOTICES.txt"
+                  "zepp-life.1.gz::https://github.com/vmvarela/zepp-life/releases/download/v${pkgver}/zepp-life.1.gz")
+          sha256sums=('__SHA_LICENSE__' '__SHA_NOTICES__' '__SHA_MAN__')
+
+          source_x86_64=("${pkgname}-${pkgver}-x86_64::https://github.com/vmvarela/zepp-life/releases/download/v${pkgver}/zepp-life-linux-amd64")
+          sha256sums_x86_64=('__SHA_X86_64__')
+
+          source_aarch64=("${pkgname}-${pkgver}-aarch64::https://github.com/vmvarela/zepp-life/releases/download/v${pkgver}/zepp-life-linux-arm64")
+          sha256sums_aarch64=('__SHA_AARCH64__')
+
+          package() {
+              install -Dm755 "${pkgname}-${pkgver}-${CARCH}" "${pkgdir}/usr/bin/${pkgname}"
+              install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+              install -Dm644 THIRD_PARTY_NOTICES.txt "${pkgdir}/usr/share/licenses/${pkgname}/THIRD_PARTY_NOTICES.txt"
+              install -Dm644 zepp-life.1.gz "${pkgdir}/usr/share/man/man1/zepp-life.1.gz"
+          }
+          PKGEOF
+
+          sed -i "s/__VERSION__/${VERSION}/g"         PKGBUILD
+          sed -i "s/__SHA_LICENSE__/${SHA_LICENSE}/g" PKGBUILD
+          sed -i "s/__SHA_NOTICES__/${SHA_NOTICES}/g" PKGBUILD
+          sed -i "s/__SHA_MAN__/${SHA_MAN}/g"         PKGBUILD
+          sed -i "s/__SHA_X86_64__/${SHA_X86_64}/g"   PKGBUILD
+          sed -i "s/__SHA_AARCH64__/${SHA_AARCH64}/g" PKGBUILD
+
+          echo "==> Generated PKGBUILD for zepp-life ${VERSION}:"
+          cat PKGBUILD
+
+      - name: Publish to AUR
+        if: ${{ env.HAS_AUR_KEY == 'true' }}
+        uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
+        with:
+          pkgname: zepp-life
+          pkgbuild: ./PKGBUILD
+          commit_username: vmvarela
+          commit_email: vmvarela@gmail.com
+          ssh_private_key: ${{ secrets.PACKAGE_SSH_KEY }}
+          commit_message: "Update to ${{ github.ref_name }}"
+
+  # ── Update WinGet manifest ──────────────────────────────────────────
+  # Submits a PR to microsoft/winget-pkgs with updated manifest files.
+  # Requires:
+  #   1. At least one version already in microsoft/winget-pkgs (the initial
+  #      submission must be done manually with wingetcreate or a PR)
+  #   2. Fork of microsoft/winget-pkgs under the vmvarela account
+  #   3. Secret: PACKAGE_DISTRIBUTION_TOKEN
+  update-winget:
+    name: Update WinGet manifest
+    needs: publish-release
+    runs-on: ubuntu-latest
+    env:
+      HAS_WINGET_TOKEN: ${{ secrets.PACKAGE_DISTRIBUTION_TOKEN != '' }}
+    steps:
+      - name: Submit WinGet manifest
+        if: ${{ env.HAS_WINGET_TOKEN == 'true' }}
+        uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: vmvarela.zepp-life
+          installers-regex: 'zepp-life-windows-.*\.exe$'
+          token: ${{ secrets.PACKAGE_DISTRIBUTION_TOKEN }}
+
+  # ── Dispatch into package-distribution ──────────────────────────────
+  # One repository_dispatch per channel, sent only after the release is
+  # public. Each destination owns its own index, state and signing keys and
+  # re-reads catalog/zepp-life.json, so the payload only carries the version.
+  # Requires: secret PACKAGE_DISTRIBUTION_TOKEN (can dispatch to the target).
+  dispatch:
+    name: Dispatch update to vmvarela/${{ matrix.repo }}
+    needs: publish-release
+    runs-on: ubuntu-latest
+    env:
+      HAS_DISTRIBUTION_TOKEN: ${{ secrets.PACKAGE_DISTRIBUTION_TOKEN != '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: [apt-packages, rpm-packages, apk-packages, nix-packages, scoop-bucket]
+    steps:
+      - name: Dispatch update-zepp-life
+        if: ${{ env.HAS_DISTRIBUTION_TOKEN == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGE_DISTRIBUTION_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh api "repos/vmvarela/${{ matrix.repo }}/dispatches" \
+            --method POST \
+            -f event_type=update-zepp-life \
+            -F "client_payload[version]=${VERSION}"
+          echo "Dispatched update-zepp-life v${VERSION} to vmvarela/${{ matrix.repo }}"

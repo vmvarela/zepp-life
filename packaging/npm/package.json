@@ -1,0 +1,32 @@
+{
+  "name": "@vmvarela/zepp-life",
+  "version": "0.0.0",
+  "description": "Store your Zepp Life data locally and inspect it",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vmvarela/zepp-life.git"
+  },
+  "homepage": "https://github.com/vmvarela/zepp-life",
+  "bugs": "https://github.com/vmvarela/zepp-life/issues",
+  "bin": {
+    "zepp-life": "bin/zepp-life.js"
+  },
+  "files": [
+    "bin/",
+    "THIRD_PARTY_NOTICES.txt"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "zepp",
+    "zepp-life",
+    "huami",
+    "activity",
+    "fitness",
+    "cli",
+    "sqlite"
+  ],
+  "author": "vmvarela <vmvarela@gmail.com>"
+}

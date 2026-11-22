@@ -1,0 +1,4 @@
+# Local and CI build outputs; the release workflow stages them in dist/.
+/zepp-life
+/zepp-life.exe
+dist/
